@@ -102,6 +102,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
       const httpClient = yield* HttpClient.HttpClient;
       const eventLoggers = yield* ProviderEventLoggers;
       const serverSettings = yield* ServerSettingsService;
+      const { cwd } = yield* ServerConfig;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -129,7 +130,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
       });
       const textGeneration = yield* makeCopilotTextGeneration(effectiveConfig, processEnv);
 
-      const checkProvider = checkCopilotProviderStatus(effectiveConfig, processEnv).pipe(
+      const checkProvider = checkCopilotProviderStatus(effectiveConfig, processEnv, cwd).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -148,6 +149,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
           enrichCopilotSnapshot({
             settings: settings.provider,
             environment: processEnv,
+            cwd,
             snapshot: currentSnapshot,
             maintenanceCapabilities,
             enableProviderUpdateChecks: settings.enableProviderUpdateChecks,

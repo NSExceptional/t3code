@@ -35,6 +35,7 @@ import type {
   SessionConfig,
   SessionEvent,
 } from "@github/copilot-sdk";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -79,6 +80,7 @@ import {
   toolItemTypeFromSdk,
 } from "../sdk/CopilotSdkRuntimeEvents.ts";
 import { type CopilotAdapterShape } from "../Services/CopilotAdapter.ts";
+import { parseCopilotSlashCommand } from "../CopilotCommands.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("copilot");
@@ -135,6 +137,7 @@ interface CopilotSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   readonly toolItemTypes: Map<string, ToolLifecycleItemType>;
+  readonly slashCommandNames: ReadonlySet<string>;
   activeTurnId: TurnId | undefined;
   activeTurnCompletion: Deferred.Deferred<{ aborted: boolean }> | undefined;
   appliedModel: string | undefined;
@@ -438,6 +441,50 @@ export function makeCopilotAdapter(
         ),
       );
 
+    const emitCopilotCommandText = (
+      ctx: CopilotSessionContext,
+      turnId: TurnId,
+      text: string,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const trimmedText = text.trim();
+        if (!trimmedText) return;
+        const itemId = `copilot-command-${yield* randomUUIDv4}`;
+        const base = {
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId,
+        };
+        yield* offerRuntimeEvent(
+          makeSdkAssistantItemEvent({
+            stamp: yield* makeEventStamp(),
+            ...base,
+            itemId,
+            lifecycle: "item.started",
+          }),
+        );
+        yield* offerRuntimeEvent(
+          makeSdkContentDeltaEvent({
+            stamp: yield* makeEventStamp(),
+            ...base,
+            itemId,
+            text: trimmedText,
+            streamKind: "assistant_text",
+            method: "commands.invoke",
+            rawPayload,
+          }),
+        );
+        yield* offerRuntimeEvent(
+          makeSdkAssistantItemEvent({
+            stamp: yield* makeEventStamp(),
+            ...base,
+            itemId,
+            lifecycle: "item.completed",
+          }),
+        );
+      });
+
     const stopSessionInternal = (ctx: CopilotSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
@@ -539,6 +586,8 @@ export function makeCopilotAdapter(
           const baseConfig = {
             workingDirectory: cwd,
             streaming: true,
+            enableConfigDiscovery: true,
+            enableSkills: true,
             onEvent,
             onPermissionRequest,
             ...(modelSelection?.model ? { model: modelSelection.model } : {}),
@@ -560,6 +609,35 @@ export function makeCopilotAdapter(
                   detail: "Failed to create or resume the Copilot SDK session.",
                   cause,
                 }),
+            ),
+          );
+          const slashCommandNames = yield* Effect.tryPromise({
+            try: async () => {
+              const commandList = await sdkSession.rpc.commands.list({
+                includeBuiltins: true,
+                includeSkills: true,
+                includeClientCommands: false,
+              });
+              return new Set(
+                commandList.commands
+                  .map((command) => command.name.trim().toLowerCase())
+                  .filter((name) => name.length > 0),
+              );
+            },
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/commands/list",
+                detail: "Failed to discover Copilot slash commands.",
+                cause,
+              }),
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Copilot slash-command discovery failed.", {
+                    cause: Cause.pretty(cause),
+                  }).pipe(Effect.as(new Set<string>())),
             ),
           );
 
@@ -589,6 +667,7 @@ export function makeCopilotAdapter(
             pendingApprovals,
             turns: [],
             toolItemTypes: new Map(),
+            slashCommandNames,
             activeTurnId: undefined,
             activeTurnCompletion: undefined,
             appliedModel: modelSelection?.model,
@@ -702,6 +781,7 @@ export function makeCopilotAdapter(
 
         // Build prompt + attachments.
         const promptText = input.input?.trim() ?? "";
+        const slashCommand = parseCopilotSlashCommand(promptText, ctx.slashCommandNames);
         const attachments: NonNullable<MessageOptions["attachments"]> = [];
         if (input.attachments && input.attachments.length > 0) {
           for (const attachment of input.attachments) {
@@ -761,6 +841,55 @@ export function makeCopilotAdapter(
         });
 
         const result = yield* Effect.gen(function* () {
+          if (slashCommand) {
+            const commandResult = yield* Effect.tryPromise({
+              try: () => ctx.sdkSession.rpc.commands.invoke(slashCommand),
+              catch: (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/commands/invoke",
+                  detail: `Failed to invoke Copilot slash command '${slashCommand.name}'.`,
+                  cause,
+                }),
+            });
+
+            if (commandResult.kind === "agent-prompt") {
+              yield* Effect.tryPromise({
+                try: () =>
+                  ctx.sdkSession.send({
+                    ...messageOptions,
+                    prompt: commandResult.prompt,
+                    agentMode: commandResult.mode === "plan" ? "plan" : "interactive",
+                  }),
+                catch: (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "session/send",
+                    detail: `Failed to send the Copilot slash command '${slashCommand.name}'.`,
+                    cause,
+                  }),
+              });
+              return yield* Deferred.await(completion);
+            }
+
+            const commandText =
+              commandResult.kind === "text"
+                ? commandResult.text
+                : commandResult.kind === "completed"
+                  ? (commandResult.message ?? "")
+                  : commandResult.kind === "select-subcommand"
+                    ? [
+                        commandResult.title,
+                        ...commandResult.options.map(
+                          (option) => `- ${option.name}: ${option.description}`,
+                        ),
+                      ].join("\n")
+                    : "";
+            yield* emitCopilotCommandText(ctx, turnId, commandText, commandResult);
+            yield* Deferred.succeed(completion, { aborted: false });
+            return yield* Deferred.await(completion);
+          }
+
           yield* Effect.tryPromise({
             try: () => ctx.sdkSession.send(messageOptions),
             catch: (cause) =>

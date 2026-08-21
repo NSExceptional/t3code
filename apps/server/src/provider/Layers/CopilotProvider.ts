@@ -9,6 +9,8 @@ import type {
   ServerProvider,
   ServerProviderAuth,
   ServerProviderModel,
+  ServerProviderSlashCommand,
+  ServerProviderSkill,
   ServerProviderState,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -34,8 +36,14 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
-import { makeCopilotSdkClient, resolveCopilotBinaryPath } from "../sdk/CopilotSdkClient.ts";
+import {
+  CopilotSdkError,
+  makeCopilotSdkClient,
+  resolveCopilotBinaryPath,
+} from "../sdk/CopilotSdkClient.ts";
 import { buildCopilotSdkModels } from "../sdk/CopilotSdkModels.ts";
+import { mapCopilotSlashCommands } from "../CopilotCommands.ts";
+import { parseCopilotSkillsCliOutput } from "../CopilotSkills.ts";
 
 const COPILOT_PRESENTATION = {
   displayName: "GitHub Copilot",
@@ -44,8 +52,12 @@ const COPILOT_PRESENTATION = {
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
+const EMPTY_MODELS: ReadonlyArray<ServerProviderModel> = [];
+const EMPTY_SKILLS: ReadonlyArray<ServerProviderSkill> = [];
+const EMPTY_SLASH_COMMANDS: ReadonlyArray<ServerProviderSlashCommand> = [];
 
 const VERSION_TIMEOUT_MS = 8_000;
+const SKILLS_TIMEOUT_MS = 10_000;
 
 // ── Version parsing ──────────────────────────────────────────────────────────
 
@@ -175,6 +187,57 @@ export const discoverCopilotModelsViaSdk = (
     ),
   );
 
+const discoverCopilotSlashCommandsViaSdk = (
+  copilotSettings: CopilotSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
+): Effect.Effect<ReadonlyArray<ServerProviderSlashCommand>, never> =>
+  makeCopilotSdkClient({
+    binaryPath: copilotSettings.binaryPath,
+    environment,
+  }).pipe(
+    Effect.flatMap((client) =>
+      Effect.acquireUseRelease(
+        client.createSession({
+          ...(cwd ? { workingDirectory: cwd } : {}),
+          enableConfigDiscovery: false,
+          enableSkills: false,
+        }),
+        (session) =>
+          Effect.tryPromise({
+            try: () =>
+              session.rpc.commands.list({
+                includeBuiltins: true,
+                includeSkills: false,
+                includeClientCommands: false,
+              }),
+            catch: (cause) =>
+              new CopilotSdkError({
+                operation: "discoverSlashCommands",
+                cause,
+              }),
+          }).pipe(Effect.map((commandList) => mapCopilotSlashCommands(commandList.commands))),
+        (session) =>
+          Effect.tryPromise({
+            try: () => session.disconnect(),
+            catch: (cause) =>
+              new CopilotSdkError({
+                operation: "disconnectSlashCommands",
+                cause,
+              }),
+          }),
+      ),
+    ),
+    Effect.scoped,
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("Copilot slash-command discovery failed.", {
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(EMPTY_SLASH_COMMANDS)),
+    ),
+  );
+
 export function getCopilotFallbackModels(
   copilotSettings: Pick<CopilotSettings, "customModels">,
 ): ReadonlyArray<ServerProviderModel> {
@@ -189,6 +252,8 @@ export function buildCopilotProviderSnapshot(input: {
   readonly parsed: CopilotVersionResult;
   readonly auth?: ServerProviderAuth;
   readonly discoveredModels?: ReadonlyArray<ServerProviderModel>;
+  readonly slashCommands?: ReadonlyArray<ServerProviderSlashCommand>;
+  readonly skills?: ReadonlyArray<ServerProviderSkill>;
   readonly discoveryWarning?: string;
 }): ServerProviderDraft {
   const auth = input.auth ?? input.parsed.auth;
@@ -207,6 +272,8 @@ export function buildCopilotProviderSnapshot(input: {
       input.copilotSettings.customModels,
       EMPTY_CAPABILITIES,
     ),
+    slashCommands: input.slashCommands ?? EMPTY_SLASH_COMMANDS,
+    skills: input.skills ?? EMPTY_SKILLS,
     probe: {
       installed: input.parsed.status !== "error" || !message?.includes("not installed"),
       version: input.parsed.version,
@@ -262,6 +329,7 @@ export function buildInitialCopilotProviderSnapshot(
 const runCopilotVersionCommand = (
   copilotSettings: CopilotSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -274,6 +342,7 @@ const runCopilotVersionCommand = (
     const command = ChildProcess.make(resolvedBinary, ["version"], {
       env: environment,
       shell: hostPlatform === "win32",
+      ...(cwd ? { cwd } : {}),
     });
     const child = yield* spawner.spawn(command);
     const [stdout, stderr, exitCode] = yield* Effect.all(
@@ -287,9 +356,72 @@ const runCopilotVersionCommand = (
     return { stdout, stderr, code: exitCode } satisfies CommandResult;
   }).pipe(Effect.scoped);
 
+const runCopilotSkillsCommand = (
+  copilotSettings: CopilotSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
+) =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const hostPlatform = yield* HostProcessPlatform;
+    const resolvedBinary = yield* Effect.promise(() =>
+      resolveCopilotBinaryPath(copilotSettings.binaryPath, environment),
+    );
+    const command = ChildProcess.make(resolvedBinary, ["skill", "list", "--json"], {
+      env: environment,
+      shell: hostPlatform === "win32",
+      ...(cwd ? { cwd } : {}),
+    });
+    const child = yield* spawner.spawn(command);
+    const [stdout, stderr, exitCode] = yield* Effect.all(
+      [
+        collectStreamAsString(child.stdout),
+        collectStreamAsString(child.stderr),
+        child.exitCode.pipe(Effect.map(Number)),
+      ],
+      { concurrency: "unbounded" },
+    );
+    return { stdout, stderr, code: exitCode } satisfies CommandResult;
+  }).pipe(Effect.scoped);
+
+const discoverCopilotSkills = (
+  copilotSettings: CopilotSettings,
+  environment: NodeJS.ProcessEnv,
+  cwd?: string,
+): Effect.Effect<
+  ReadonlyArray<ServerProviderSkill>,
+  never,
+  ChildProcessSpawner.ChildProcessSpawner
+> =>
+  runCopilotSkillsCommand(copilotSettings, environment, cwd).pipe(
+    Effect.timeoutOption(SKILLS_TIMEOUT_MS),
+    Effect.flatMap((result) =>
+      Option.match(result, {
+        onNone: () =>
+          Effect.logWarning("Copilot skill discovery timed out.").pipe(Effect.as(EMPTY_SKILLS)),
+        onSome: (commandResult) => {
+          if (commandResult.code !== 0) {
+            return Effect.logWarning("Copilot skill discovery failed.", {
+              exitCode: commandResult.code,
+            }).pipe(Effect.as(EMPTY_SKILLS));
+          }
+          return Effect.succeed(parseCopilotSkillsCliOutput(commandResult.stdout));
+        },
+      }),
+    ),
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("Copilot skill discovery failed.", {
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(EMPTY_SKILLS)),
+    ),
+  );
+
 export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus")(function* (
   copilotSettings: CopilotSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = getCopilotFallbackModels(copilotSettings);
@@ -310,7 +442,7 @@ export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus"
     });
   }
 
-  const versionProbe = yield* runCopilotVersionCommand(copilotSettings, environment).pipe(
+  const versionProbe = yield* runCopilotVersionCommand(copilotSettings, environment, cwd).pipe(
     Effect.timeoutOption(VERSION_TIMEOUT_MS),
     Effect.result,
   );
@@ -355,12 +487,14 @@ export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus"
   const envAuth = detectCopilotAuthFromEnvironment(environment);
   const effectiveAuth: ServerProviderAuth =
     envAuth.status === "authenticated" ? envAuth : parsed.auth;
+  const skills = yield* discoverCopilotSkills(copilotSettings, environment, cwd);
 
   return buildCopilotProviderSnapshot({
     checkedAt,
     copilotSettings,
     parsed,
     auth: effectiveAuth,
+    skills,
   });
 });
 
@@ -370,6 +504,7 @@ export const enrichCopilotSnapshot = (input: {
   readonly settings: CopilotSettings;
   readonly environment?: NodeJS.ProcessEnv;
   readonly snapshot: ServerProvider;
+  readonly cwd?: string;
   readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
   readonly enableProviderUpdateChecks?: boolean;
   readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
@@ -410,21 +545,42 @@ export const enrichCopilotSnapshot = (input: {
       // and keying off it re-spawned an SDK client + `listModels()` every cycle.
       const nonCustomModels = baseSnapshot.models.filter((m) => !m.isCustom);
       const modelsNeedDiscovery = nonCustomModels.length === 0;
-      if (!modelsNeedDiscovery) {
+      const slashCommandsNeedDiscovery = baseSnapshot.slashCommands.length === 0;
+      if (!modelsNeedDiscovery && !slashCommandsNeedDiscovery) {
         return Effect.void;
       }
 
-      return discoverCopilotModelsViaSdk(settings, input.environment).pipe(
-        Effect.flatMap((discoveredModels) => {
-          if (discoveredModels.length === 0) return Effect.void;
+      return Effect.all(
+        {
+          discoveredModels: modelsNeedDiscovery
+            ? discoverCopilotModelsViaSdk(settings, input.environment)
+            : Effect.succeed(EMPTY_MODELS),
+          discoveredSlashCommands: slashCommandsNeedDiscovery
+            ? discoverCopilotSlashCommandsViaSdk(settings, input.environment, input.cwd)
+            : Effect.succeed(EMPTY_SLASH_COMMANDS),
+        },
+        { concurrency: "unbounded" },
+      ).pipe(
+        Effect.flatMap(({ discoveredModels, discoveredSlashCommands }) => {
+          if (discoveredModels.length === 0 && discoveredSlashCommands.length === 0) {
+            return Effect.void;
+          }
+          const nextModels =
+            discoveredModels.length > 0
+              ? providerModelsFromSettings(
+                  discoveredModels,
+                  settings.customModels,
+                  EMPTY_CAPABILITIES,
+                )
+              : baseSnapshot.models;
           return publishSnapshot(
             stampIdentity({
               ...baseSnapshot,
-              models: providerModelsFromSettings(
-                discoveredModels,
-                settings.customModels,
-                EMPTY_CAPABILITIES,
-              ),
+              models: nextModels,
+              slashCommands:
+                discoveredSlashCommands.length > 0
+                  ? discoveredSlashCommands
+                  : baseSnapshot.slashCommands,
             }),
           );
         }),
